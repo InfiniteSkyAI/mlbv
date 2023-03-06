@@ -16,6 +16,7 @@ import pytz
 import mlbv.mlbam.common.config as config
 import mlbv.mlbam.common.util as util
 import mlbv.mlbam.common.session as session
+import pkce
 
 LOG = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ CLIENT_API_KEY_RE = re.compile(r'"clientApiKey":"([^"]+)"')
 OKTA_CLIENT_ID_RE = re.compile("""production:{clientId:"([^"]+)",""")
 MLB_OKTA_URL = "https://www.mlbstatic.com/mlb.com/vendor/mlb-okta/mlb-okta.js"
 AUTHN_URL = "https://ids.mlb.com/api/v1/authn"
+TOKEN_URL = "https://ids.mlb.com/oauth2/aus1m088yK07noBfh356/v1/token"
 OKTA_AUTHORIZE_URL = "https://ids.mlb.com/oauth2/aus1m088yK07noBfh356/v1/authorize"
 BAM_DEVICES_URL = "https://us.edge.bamgrid.com/devices"
 BAM_SESSION_URL = "https://us.edge.bamgrid.com/session"
@@ -123,11 +125,36 @@ class MLBSession(session.Session):
         def get_okta_token():
             state_param = gen_random_string(64)
             nonce_param = gen_random_string(64)
+            code_verifier, code_challenge = pkce.generate_pkce_pair()
+
+            def exchange_okta_code_for_token(code):
+                exchange_token_params = {
+                    "client_id": self._state["okta_client_id"],
+                    "redirect_uri": "https://www.mlb.com/login",
+                    "grant_type": "authorization_code",
+                    "code_verifier": code_verifier,
+                    "code": code
+                }
+
+                token_headers = {
+                    "content-type": "application/x-www-form-urlencoded"
+                }
+
+                exchange_token_response = self.session.post(
+                    TOKEN_URL,
+                    params=exchange_token_params,
+                    headers=token_headers
+                )
+
+                return exchange_token_response.json()['access_token']
+
             authz_params = {
                 "client_id": self._state["okta_client_id"],
                 "redirect_uri": "https://www.mlb.com/login",
-                "response_type": "id_token token",
+                "response_type": "code",
                 "response_mode": "okta_post_message",
+                "code_challenge_method": "S256",
+                "code_challenge": code_challenge,
                 "state": state_param,
                 "nonce": nonce_param,
                 "prompt": "none",
@@ -139,8 +166,11 @@ class MLBSession(session.Session):
             if config.VERBOSE:
                 LOG.debug("get_okta_token reponse: %s", authz_content)
             for line in authz_content.split("\n"):
-                if "data.access_token" in line:
-                    return line.split("'")[1].encode("utf-8").decode("unicode_escape")
+                if "data.code" in line:
+                    return exchange_okta_code_for_token(
+                        line.split("'")[1].encode("utf-8").decode("unicode_escape")
+                    )
+
                 if "data.error = 'login_required'" in line:
                     raise SGProviderLoginException
             LOG.debug("get_okta_token failed: %s", authz_content)
